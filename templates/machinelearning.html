@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html lang="en">
+<h2>MachineLearningComponent</h2>
+<p>
+	{% with messages = get_flashed_messages() %}
+	  {% if messages %}
+		<ul class=flashes>
+		{% for message in messages %}
+		  <li>{{ message }}</li>
+		{% endfor %}
+		</ul>
+	  {% endif %}
+	{% endwith %}
+<form method="post" action="/machinelearning/machinelearning" enctype="multipart/form-data">
+    <p>
+		<input type="submit" value="Run machine learning Algorithm">
+	</p>
+</form>
+</html>

@@ -1,124 +1,87 @@
-from flask import Flask, flash, render_template, Blueprint, session
-from keras.applications.vgg19 import VGG19
-from keras.preprocessing import image
-from keras.applications.vgg19 import preprocess_input
-from keras.models import Model
+"""VGG19 features + linear SVM, using explicitly supplied training labels."""
+import csv
+from functools import lru_cache
+from pathlib import Path
+import re
+
+from flask import Blueprint, current_app, flash, render_template, session
 import numpy as np
-import matplotlib.pyplot as plt
+from sklearn.metrics import accuracy_score
 from sklearn.model_selection import train_test_split
 from sklearn.svm import LinearSVC
-from sklearn.metrics import accuracy_score
-import os
-import tensorflow as tf
 
-# Variables
-UPLOAD_FOLDER = 'C:/Users/tondi/OneDrive/Documents/GitHub/CSEE5590-IOT-Robotics/ICP 9/downloads'
-machinelearning = Blueprint('machinelearning',__name__, template_folder='/templates')
+machinelearning = Blueprint('machinelearning', __name__)
 
 
-# Model information
-base_model = VGG19(weights='imagenet')
-model = Model(inputs=base_model.input, outputs=base_model.get_layer('flatten').output)
-global graph
-graph = tf.get_default_graph()
+@lru_cache(maxsize=1)
+def feature_model():
+    from tensorflow.keras.applications.vgg19 import VGG19
+    from tensorflow.keras.models import Model
+    base = VGG19(weights='imagenet')
+    return Model(inputs=base.input, outputs=base.get_layer('flatten').output)
 
 
-def get_features(img_path):
-    img = image.load_img(img_path, target_size=(224, 224))
-    x = image.img_to_array(img)
-    x = np.expand_dims(x, axis=0)
-    x = preprocess_input(x)
-    with graph.as_default():
-        flatten = model.predict(x)
-    return list(flatten[0])
+def get_features(path):
+    from tensorflow.keras.utils import load_img, img_to_array
+    from tensorflow.keras.applications.vgg19 import preprocess_input
+    image = load_img(path, target_size=(224, 224))
+    batch = np.expand_dims(img_to_array(image), axis=0)
+    return feature_model().predict(preprocess_input(batch), verbose=0)[0]
 
 
-# plot waveforms
+def load_training_manifest(path):
+    manifest = Path(path).resolve()
+    root = manifest.parent
+    rows = []
+    with manifest.open(newline='', encoding='utf-8') as stream:
+        reader = csv.DictReader(stream)
+        if reader.fieldnames != ['path', 'label']:
+            raise ValueError('Training manifest must have the header path,label.')
+        for row in reader:
+            if None in row or not row.get('path') or not (row.get('label') or '').strip():
+                raise ValueError('Each training image needs an explicit label.')
+            image = (root / row['path']).resolve()
+            if not image.is_relative_to(root) or image.suffix.lower() not in {'.png', '.jpg', '.jpeg'}:
+                raise ValueError('Training image paths must stay within the manifest directory.')
+            if not image.is_file():
+                raise ValueError('A training image listed in the manifest is missing.')
+            rows.append((image, row['label'].strip()))
+    labels, counts = np.unique([label for _, label in rows], return_counts=True)
+    if len(labels) < 2 or min(counts) < 2:
+        raise ValueError('Provide at least two classes with at least two labelled images per class.')
+    return rows
 
 
-def plot_waveforms(file_name):
-    audio = file_name[1]
-    plt.plot(audio)
-    plt.ylabel("Amplitude")
-    plt.xlabel("Time")
-    plt.savefig("downloads/wav_plots/" + "test_sample.png")
-    plt.close("all")
-    with open(UPLOAD_FOLDER + "/wav_plots/test_sample.png") as f:
-        wave_form = f.read()
-    return wave_form
-
-# Flask
-
-
-@machinelearning.route('/')
+@machinelearning.get('/')
 def upload_machinelearning_form():
-    flash('File successfully uploaded and ready for machine learning')
     return render_template('machinelearning.html')
 
 
-@machinelearning.route('/machinelearning', methods=['POST'])
+@machinelearning.post('/machinelearning')
 def run_machinelearning():
-    print("line 56")
-    X = []
-    y = []
-    audio_plots = []
-    audio_parts_plots = []
-    for (_, _, filenames) in os.walk('downloads/wav_plots/'):
-        audio_plots.extend(filenames)
-        break
-    for (_, _, filenames) in os.walk('downloads/audio_parts_classes/'):
-        audio_parts_plots.extend(filenames)
-        break
-    print(audio_plots)
-    count = 1
-    for aplot in audio_plots:
-        if count < len(audio_plots)/2:
-            X.append(get_features(UPLOAD_FOLDER + '/wav_plots/' + aplot))
-            y.append(0)
-            count += 1
-        else:
-            X.append(get_features(UPLOAD_FOLDER + '/wav_plots/' + aplot))
-            y.append(1)
-            count += 1
-    count = 1
-    for aplot in audio_parts_plots:
-            X.append(get_features(UPLOAD_FOLDER + '/audio_parts_classes/' + aplot))
-            y.append(2)
-            count += 1
-            # X.append(get_features(UPLOAD_FOLDER + '/audio_parts_classes/' + aplot))
-            # y.append(3)
-            # count += 1
-
-    print(X, "line 71")
-    print(y, "line 72")
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.30, random_state=42, stratify=y)
-    clf = LinearSVC(random_state=0, tol=1e-5)
-    labels = np.unique(X_train)
-    print(labels, "line 80")
-    labels = np.unique(y_train)
-    print(labels, "line 82")
-    print(clf, "line clf")
-    clf.fit(X_train, y_train)
-    print("line 83")
-    predicted = clf.predict(X_test)
-
-    # get the accuracy
-    flash(accuracy_score(y_test, predicted))
-    print(accuracy_score(y_test, predicted))
+    manifest = current_app.config['TRAINING_MANIFEST']
+    if not manifest:
+        flash('Set TRAINING_MANIFEST to a CSV of labelled waveform images before training.')
+        return render_template('machinelearning.html'), 400
+    try:
+        rows = load_training_manifest(manifest)
+    except (OSError, ValueError) as error:
+        # Do not expose local filesystem paths in the UI.
+        flash(str(error) if isinstance(error, ValueError) else 'Could not read the training manifest.')
+        return render_template('machinelearning.html'), 400
+    features = [get_features(path) for path, _ in rows]
+    labels = [label for _, label in rows]
+    classes = len(set(labels))
+    test_count = max(classes, int(np.ceil(len(labels) * 0.30)))
+    train_x, test_x, train_y, test_y = train_test_split(
+        features, labels, test_size=test_count, random_state=42, stratify=labels)
+    classifier = LinearSVC(random_state=42, tol=1e-5, max_iter=10000)
+    classifier.fit(train_x, train_y)
+    flash(f'Held-out accuracy on the supplied images: {accuracy_score(test_y, classifier.predict(test_x)):.3f}')
+    job_id = session.get('job_id', '')
+    if re.fullmatch(r'[0-9a-f]{32}', job_id):
+        plots = Path(current_app.config['UPLOAD_FOLDER']) / job_id / 'wav_plots'
+        for image in sorted(plots.glob('*.png')):
+            prediction = classifier.predict([get_features(image)])[0]
+            flash(f'{image.stem}: {prediction}')
     return render_template('machinelearning.html')
-
-
-#    with open(UPLOAD_FOLDER + "/wav_plots/") as f:
-#        print("line 57")
-#        file_content = f.read()
-#    X = []
-#    Y = []
-#    X.append(get_features(plot_waveforms(file_content)))
-#    Y.append(0)
-#    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.30, random_state=42, stratify=y)
-#    clf = LinearSVC(random_state=0, tol=1e-5)
-#    clf.fit(X_train, y_train)
-#    predicted = clf.predict(X_test)
-#    # get the accuracy
-#    flash(accuracy_score(y_test, predicted))
-#    return render_template('machinelearning.html')

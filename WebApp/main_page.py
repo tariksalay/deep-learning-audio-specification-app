@@ -1,103 +1,80 @@
-from os import walk
-import os
-from flask import Flask, flash, request, redirect, render_template, Blueprint, session
-from werkzeug.utils import secure_filename
-from pydub import AudioSegment
-from scipy.io.wavfile import read
-import matplotlib.pyplot as plt
+"""Validate uploads and generate waveform images in a separate job directory."""
 from pathlib import Path
-import ffmpeg
+from uuid import uuid4
+import shutil
 
-# Variables
+from flask import Blueprint, current_app, flash, redirect, render_template, request, session, url_for
+from werkzeug.utils import secure_filename
 
-app = Flask(__name__)
-main_page = Blueprint('main_page',__name__, template_folder='/templates')
-UPLOAD_FOLDER = 'C:/Users/tondi/OneDrive/Documents/GitHub/CSEE5590-IOT-Robotics/ICP 9/downloads'
-ALLOWED_EXTENSIONS = set(['txt', 'wav', 'mp3'])
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-app.secret_key = 'secret key'
+main_page = Blueprint('main_page', __name__)
+ALLOWED_EXTENSIONS = {'wav', 'mp3'}
 
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 
-def plot_waves():
-    if not os.path.exists("downloads/wav_plots"):
-        os.makedirs("downloads/wav_plots")
-    wavs = []
-    print("line 29")
-    for (_, _, filenames) in walk('downloads/audio_parts'):
-        wavs.extend(filenames)
-        print("line 32")
-        break
-    for wav in wavs:
-        # read audio samples
-        input_data = read("downloads/audio_parts/" + wav)
-        audio = input_data[1]
-        # plot the first 1024 samples
-        plt.plot(audio)
-        # label the axes
-        plt.ylabel("Amplitude")
-        plt.xlabel("Time")
-        # set the title
-        # plt.title("Sample Wav")
-        # display the plot
-        plt.savefig("downloads/wav_plots/" + wav.split('.')[0] + '.png')
-        # plt.show()
-        plt.close('all')
-        print("line 36")
-    print("line 37")
-    return redirect('/machinelearning')
+def extract_audio(audio, job):
+    import matplotlib
+    matplotlib.use('Agg')
+    from matplotlib.figure import Figure
+    import numpy as np
+    parts = job / 'audio_parts'
+    plots = job / 'wav_plots'
+    parts.mkdir()
+    plots.mkdir()
+    # Keep the prototype bounded: at most 12 short, overlapping waveform windows.
+    for number, start in enumerate(range(0, min(len(audio), 6000), 500), 1):
+        clip = audio[start:min(start + 1500, len(audio))].set_channels(1)
+        with (parts / f'audio_parts{number}.wav').open('wb') as output:
+            clip.export(output, format='wav')
+        samples = np.array(clip.get_array_of_samples())
+        figure = Figure(figsize=(6.4, 4.8))
+        axis = figure.subplots()
+        axis.plot(np.arange(len(samples)) / clip.frame_rate, samples)
+        axis.set(xlabel='Time (seconds)', ylabel='Amplitude')
+        figure.savefig(plots / f'audio_parts{number}.png')
+        figure.clear()
 
 
-def extract_audio(filename):
-    if not os.path.exists("downloads/audio_parts"):
-        os.makedirs("downloads/audio_parts")
-    count = 1
-    for i in range(1, 60, 5):
-        t1 = i * 100
-        t2 = (i+15) * 100
-        newAudio = filename
-        newAudio = newAudio[t1:t2]
-        newAudio.export(UPLOAD_FOLDER + "/audio_parts/audio_parts" + str(count) + '.wav', format="wav")  # Exports to a wav file in the current path.
-        count += 1
-    return plot_waves()
-# Flask
-
-
-@main_page.route('/')
+@main_page.get('/')
 def upload_form():
     return render_template('upload.html')
 
 
-@main_page.route('/', methods=['POST'])
+@main_page.post('/')
 def upload_file():
-    if request.method == 'POST':
-        # check if the post request has the file part
-        if 'file' not in request.files:
-            flash('No file part')
-            return redirect(request.url)
-        file = request.files['file']
-        if file.filename == '':
-            flash('No file selected for uploading')
-            return redirect(request.url)
-        if file and allowed_file(file.filename):
-            filename = secure_filename(file.filename)
-            file.save(os.path.join(app.config['UPLOAD_FOLDER'], UPLOAD_FOLDER + '/' + filename))
-            print(filename)
-            ##AudioSegment.converter = "C:/Users/tondi/OneDrive/Documents/Packages/ffmpeg-20191031-7c872df-win64-static/bin/ffmpeg.exe"
-            filename = AudioSegment.from_file(UPLOAD_FOLDER + '/' + filename, format="mp3")
-            print(filename)
-            filename.export(UPLOAD_FOLDER + "/wavfile.wav", format="wav")
-            file.save(os.path.join(app.config['UPLOAD_FOLDER'], "wavfile.wav"))
-            ##session['filename'] = filename
-            flash('File successfully uploaded')
-            print(filename)
-            return extract_audio(filename)
-        else:
-            flash('Allowed file types are mp3, wav')
-            return redirect(request.url)
-
-
-
+    file = request.files.get('file')
+    if file is None or not file.filename:
+        flash('Choose an audio file.')
+        return redirect(url_for('main_page.upload_form'))
+    filename = secure_filename(file.filename)
+    if not filename or not allowed_file(filename):
+        flash('Allowed file types are mp3 and wav.')
+        return redirect(url_for('main_page.upload_form'))
+    job_id = uuid4().hex
+    job = Path(current_app.config['UPLOAD_FOLDER']) / job_id
+    job.mkdir()
+    try:
+        from pydub import AudioSegment
+        from pydub.exceptions import CouldntDecodeError
+        source = job / filename
+        file.save(source)
+        try:
+            with source.open('rb') as stream:
+                audio = AudioSegment.from_file(stream, format=source.suffix.lstrip('.'))
+        except (CouldntDecodeError, OSError):
+            flash('Could not decode this audio. MP3 files require FFmpeg on PATH.')
+            shutil.rmtree(job)
+            return redirect(url_for('main_page.upload_form'))
+        if not 0 < len(audio) <= current_app.config['MAX_AUDIO_MS']:
+            flash('Use an audio clip between 1 millisecond and 60 seconds.')
+            shutil.rmtree(job)
+            return redirect(url_for('main_page.upload_form'))
+        extract_audio(audio, job)
+    except Exception:
+        shutil.rmtree(job, ignore_errors=True)
+        raise
+    session['job_id'] = job_id
+    flash('Audio uploaded and waveform windows generated.')
+    return redirect(url_for('machinelearning.upload_machinelearning_form'))
